@@ -22,7 +22,7 @@
                      anchors.fill: parent
                      orientation: ListView.Horizontal
 -                    model: modelData.trays
-+                    model: modelData.trays.slice(0, X1Plus.DDS.amsInfo().ams[index].tray.length)
++                    model: modelData.trays.slice(0, X1Plus.DDS.amsInfo().ams[index].tray.length || 4)
                      delegate: Item {
                          width: amsRegion.width / 4
                          height: amsRegion.height
