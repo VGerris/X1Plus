@@ -11,12 +11,59 @@
 #include <pthread.h>
 #include <sys/mman.h>
 
+#include <iostream>
+#include <regex>
 #include <vector>
 #include <string>
 
 #include "vendor/nlohmann/json.hpp"
 
 #define PRINTF_BLUE(s, ...) do { printf("\x1B[1;96m" s "\x1B[0m", ##__VA_ARGS__); fflush(stdout); } while(0)
+
+/* To enable AMS2/AMSHT support, we need to teach an old forward to talk to
+ * a new MC (getting a new forward to run on an old AP FW version might also
+ * have worked, but this seemed easier up until it was too late to give up).
+ *
+ * The general game plan for getting an old forward to talk to a new MC is:
+ *
+ *   - The AMS protocol has changed to "AMSv2" in the new MC, generally
+ *     referring to AMSes as two bytes (AMS ID + slot ID) rather than a
+ *     single byte with the LSBs representing the slot.  An old forward
+ *     still only can speak of up to four AMSes, 0 through 3, so we
+ *     internally remap AMS IDs that we detect from an "advanced" MC into
+ *     the old forward's namespace.
+ *
+ *   - Once we have remapping primitives available, we can now patch forward
+ *     to use them.  We implement all of the inbound AMSv2 commands and
+ *     responses, and map them as appropriate to the original forward's
+ *     understanding of AMSv1 commands and responses using our AMS ID
+ *     mapping (and if we have to store other data, we do that too).
+ *
+ *   - Also, AMS HTs have an ID of 0x80, 0x81, ..., and have a different
+ *     mcproto destination ID.  `upgrade` doesn't know how to talk to these,
+ *     so we help it out by patching its outbound requests using our mapping
+ *     table, and by patching AMS HT requests to have the right destination. 
+ *     Then, we patch the responses as appropriate, as well.
+ *
+ *   - There are a handful of Gcode commands from the slicer or from
+ *     bbl_screen that use an "old" syntax for how to talk to the AMS
+ *     (asking for "gcode-logical" toolheads, rather than physical
+ *     toolheads).  We intercept and remap those.
+ *
+ *   - We need to communicate new data outbound; any time forward doesn't
+ *     know how to collect data, we patch the data transmit routines with
+ *     data that we stash in sidecar variables.
+ *
+ *   - And, we want to implement the new drying functionality!  So we
+ *     intercept inbound requests, and patch those to generate MC commands,
+ *     if necessary.
+ */
+
+/* TODO:
+ *  validate implementation of mc_ams_flush_param_cb
+ *  maybe figure out what is the other parameter in mc_ams_flush_param_cb? 
+ *  support command: "auto_stop_ams_dry" -- may not actually be triggered
+ */
 
 using namespace nlohmann;
 
@@ -26,30 +73,7 @@ using namespace nlohmann;
 #define EXTERN_C
 #endif
 
-struct CProtocal;
-struct CGparser;
-
-// set to true if we receive any indication that the attached MC speaks the
-// new protocol, set to false if we receive indication that the MC is
-// speaking the old protocol to us.
-//
-// any time we would do a new->old translation, check this!
-bool mc_speaks_new_protocol = false;
-
-void mc_spoke_new_protocol() {
-    if (!mc_speaks_new_protocol) {
-        PRINTF_BLUE("forward_shim: switching to new-style MC protocol\n");
-    }
-    mc_speaks_new_protocol = true;
-}
-
-void mc_spoke_old_protocol() {
-    if (mc_speaks_new_protocol) {
-        PRINTF_BLUE("forward_shim: switching to old-style MC protocol\n");
-    }
-    mc_speaks_new_protocol = false;
-}
-
+/*** forward / mcproto constants ***/
 
 enum dm_id {
     DM_MC     = 0x0300,
@@ -84,14 +108,8 @@ enum msg_type {
 };
 
 struct CProtocal;
+struct CGparser;
 struct packet_message_t;
-
-/* TODO:
- *  validate implementation of mc_ams_flush_param_cb
- *  maybe figure out what is the other parameter in mc_ams_flush_param_cb? 
- *  make sure AMS2 works
- *  support command: "auto_stop_ams_dry" -- may not actually be triggered
- */
 
 #if defined(FIRMWARE_00_00_32_39)
 #  include "forward_defs.00.00.32.39.h"
@@ -99,21 +117,33 @@ struct packet_message_t;
 #  error no offsets defined for this firmware?
 #endif
 
+// We don't want to patch if we're still running an old MC -- that would
+// break the old MC's AMS support. 
+//
+// The below is set to true if we receive any indication that the attached
+// MC speaks the new protocol, set to false if we receive indication that
+// the MC is speaking the old protocol to us.
+//
+// any time we would do a new->old translation, check this!
+bool mc_speaks_new_protocol = false;
+
+void mc_spoke_new_protocol() {
+    if (!mc_speaks_new_protocol) {
+        PRINTF_BLUE("forward_shim: switching to new-style MC protocol\n");
+    }
+    mc_speaks_new_protocol = true;
+}
+
+void mc_spoke_old_protocol() {
+    if (mc_speaks_new_protocol) {
+        PRINTF_BLUE("forward_shim: switching to old-style MC protocol\n");
+    }
+    mc_speaks_new_protocol = false;
+}
+
 int CProtocal_send_mcu_packet_override(CProtocal *_this, void *payload, size_t payload_length, uint32_t req, uint32_t dest, uint32_t src, uint32_t msg_id, uint32_t msg_class, uint32_t param_8);
 
-// annoyingly, we cannot just get this from dlfcn.h, because glibc version bad
-# define RTLD_NEXT      ((void *) -1l)
-extern
-#ifdef __cplusplus
-"C"
-#endif
-void *dlsym(void *handle, const char *symbol);
-
-#define SWIZZLE(rtype, name, ...) \
-    EXTERN_C rtype name(__VA_ARGS__) { \
-        rtype (*next)(__VA_ARGS__) = (rtype(*)(__VA_ARGS__))dlsym(RTLD_NEXT, #name);
-
-/*** AMS I/O ***/
+/*** AMS mapping ***/
 
 /* On new MCs, you can have up to 4 AMS-legacy and up to 16 AMS-HT (and the
  * AMS HT are all mapped in a different namespace than AMS/AMS2 -- they have
@@ -167,15 +197,13 @@ uint8_t ams_phys_to_log(uint8_t phys_id) {
     return 0xFF;
 }
 
+/*** JSON-side overrides ***/
+
 static pthread_mutex_t _dry_response_wait_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t _dry_response_wait_cvar = PTHREAD_COND_INITIALIZER;
 static bool _dry_response_did_respond = 0;
 static uint8_t _dry_response_ams_id = 0;
 static uint32_t _dry_response_code = 0;
-
-
-
-#include <iostream>
 
 extern "C" void update_ams_object_with_flags_override_C(void *ams_obj, json &j, int param3) {
     j["supports_ams_v2"] = mc_speaks_new_protocol;
@@ -264,10 +292,6 @@ extern "C" void update_ams_object_with_flags_override_C(void *ams_obj, json &j, 
         }
     }
 }
-
-
-#include <iostream>
-#include <regex>
 
 extern "C" int handle_print_dds_message_override(CGparser *_this, json &j, int param3) {
     std::cout << j << std::endl;
@@ -539,8 +563,7 @@ extern "C" void *replace_next_extruder_filament_temp_override(std::string &path,
     return replace_next_extruder_filament_temp_orig(path, b, next_extruder, new_temp);
 }
 
-/*** AMS temperature table ***/
-
+/*** AMS temperature table and mcproto implementation for lookups ***/
 
 struct ams_temp_table {
     const char *name;
@@ -623,7 +646,7 @@ int CProtocal_handle_mc_ams_flush_param(CProtocal *_this) {
     return 0;
 }
 
-/*** AMS callbacks ***/
+/*** AP-to-MC overrides ***/
 
 int CProtocal_send_mcu_packet_override(CProtocal *_this, void *payload, size_t payload_length, uint32_t req, uint32_t dest, uint32_t src, uint32_t msg_id, uint32_t msg_class, uint32_t param_8) {
     if (!mc_speaks_new_protocol) {
@@ -786,6 +809,8 @@ int CProtocal_send_mcu_packet_override(CProtocal *_this, void *payload, size_t p
     }
 }
 
+/*** MC-to-AP overrides ***/
+
 int (*CProtocal_original_ams_report)(CProtocal *) = NULL;
 int CProtocal_handle_ams_report(CProtocal *_this) {
     mc_spoke_old_protocol();
@@ -818,6 +843,15 @@ struct __attribute__((packed)) ams_desc {
     uint8_t dry_sta;        // 10
     uint8_t adapter_sta;    // 11: 02 if plugged in, 00 if not
 };
+
+/* This is the meat of our work here: when MC sends us an AMSv2 data update,
+ * we should 1) use it to assign logical-vs-physical AMS IDs, and then 2)
+ * synthesize an AMSv1 report packet back to the legacy forward.
+ *
+ * When we have extra data that we can't represent in an AMSv1 packet --
+ * like temperature, drying time, precise humidity, etc.  -- we store it in
+ * the logical-AMS structure, struct ams_info.
+ */
 
 int CProtocal_handle_ams_v2_ams_info_update(CProtocal *_this) {
     mc_spoke_new_protocol();
@@ -1032,6 +1066,9 @@ int CProtocal_handle_ams_v2_ams_info_update(CProtocal *_this) {
     return 0;
 }
 
+/* The other overrides mostly just convert logical to physical AMS IDs, or
+ * two-byte to one-byte formats.  */
+
 int (*CProtocal_original_get_version)(CProtocal *) = NULL;
 int CProtocal_handle_get_version(CProtocal *_this) {
     if (_this->packet->src_addr == DM_AMS_HT || _this->packet->src_addr == DM_AMS) {
@@ -1112,6 +1149,7 @@ int CProtocal_handle_link_ams_tray_consumption_ack2(CProtocal *_this) {
 }
 
 int CProtocal_handle_ams_v2_ams_mapping(CProtocal *_this) {
+    /* this is a request */
     mc_spoke_new_protocol();
 
     PRINTF_BLUE("forward: rewriting ams_v2_ams_mapping to ams_mapping\n");
@@ -1179,6 +1217,8 @@ extern "C" void CProtocal_setup_callbacks_override_C(CProtocal *_this) {
     _this->packet_info[0x2][MSG_AMS_V2_AMS_FLUSH_PARAM].callback = CProtocal_handle_mc_ams_flush_param;
 }
 
+/*** Main AMSv2 patch entrypoint ***/
+
 void patch_ams_callbacks() {
 
 #define DO_PATCH(what) \
@@ -1203,6 +1243,18 @@ void patch_ams_callbacks() {
 }
 
 /*** DBus patches ***/
+
+// annoyingly, we cannot just get this from dlfcn.h, because glibc version bad
+# define RTLD_NEXT      ((void *) -1l)
+extern
+#ifdef __cplusplus
+"C"
+#endif
+void *dlsym(void *handle, const char *symbol);
+
+#define SWIZZLE(rtype, name, ...) \
+    EXTERN_C rtype name(__VA_ARGS__) { \
+        rtype (*next)(__VA_ARGS__) = (rtype(*)(__VA_ARGS__))dlsym(RTLD_NEXT, #name);
 
 typedef struct DBusError {
     const char *name;
