@@ -68,6 +68,7 @@ enum msg_type {
     MSG_DDS_RECORDER                = 0x08,
     MSG_AMS_REPORT                  = 0x0f,
     MSG_AMS_TRAY_INFO_READ          = 0x11,
+    MSG_GCODE_LINE_HANDLE           = 0x16,
     MSG_AMS_MAPPING                 = 0x17,
     MSG_AMS_TRAY_INFO_WRITE         = 0x18,
     MSG_AMS_TRAY_CONSUMPTION        = 0x1c,
@@ -500,6 +501,7 @@ publish_result:
         try {
             std::vector<int> new_ams_mapping;
             for (int map: j.at("ams_mapping")) {
+                PRINTF_BLUE("forward: input ams_mapping: %d\n", map);
                 if (map == -1) {
                     new_ams_mapping.push_back(-1);
                 } else {
@@ -649,13 +651,26 @@ int CProtocal_send_mcu_packet_override(CProtocal *_this, void *payload, size_t p
             dt.tv_nsec += 1000000000;
         }
         
-        if (dt.tv_sec < 5) {
+        if (dt.tv_sec < 2) {
             //PRINTF_BLUE("CProtocal_send_mcu_packet_override: nerfing req %x for dm %x\n", msg_id, dest);
             return 1;
         }
         //PRINTF_BLUE("CProtocal_send_mcu_packet_override: allowing req %x for dm %x through\n", msg_id, dest);
         last_req[req_id] = now;
-        return CProtocal_send_mcu_packet_override(_this, payload, payload_length, req, dest, src, msg_id, msg_class, param_8);
+        return CProtocal_send_mcu_packet_orig(_this, payload, payload_length, req, dest, src, msg_id, msg_class, param_8);
+    } else if (msg_class == 0x02 && msg_id == MSG_GCODE_LINE_HANDLE) {
+        char *m620_e = (payload_length >= 4) ? (char *)memmem((char *)payload + 4, payload_length - 4, "M620 E", 6) : NULL;
+        // new MC always requires the AMS to be on; AMS-off is handled by
+        // pretending that AMS is on and sending an 0xFF00 AMS routing
+        if (m620_e) {
+            if (m620_e[6] == '0') {
+                PRINTF_BLUE("CProtocal_send_mcu_packet_override: found M620 E0, patching to M620 E1; use_ams = %d\n", _this->gparser.use_ams);
+                m620_e[6] = '1';
+            } else {
+                PRINTF_BLUE("CProtocal_send_mcu_packet_override: found M620 E1, use_ams = %d\n", _this->gparser.use_ams);
+            }
+        }
+        return CProtocal_send_mcu_packet_orig(_this, payload, payload_length, req, dest, src, msg_id, msg_class, param_8);
     } else if (msg_class == 0x02 && msg_id == MSG_AMS_TRAY_CONSUMPTION) {
         /* this actually needed to be a link_ams_tray_consumption_v2 */
         uint8_t pl = *(uint8_t *)payload;
@@ -705,6 +720,9 @@ int CProtocal_send_mcu_packet_override(CProtocal *_this, void *payload, size_t p
         new_map.len = 0x20;
         new_map.vers = old_map->vers;
         PRINTF_BLUE("forward: CProtocal_send_mcu_packet_override: ams_mapping vers %02x\n", new_map.vers);
+        if (_this->gparser.use_ams == false) {
+            PRINTF_BLUE("forward: CProtocal_send_mcu_packet_override: ams_mapping: use_ams = false!\n");
+        }
         for (int i = 0; i < 16; i++) {
             
             PRINTF_BLUE("forward: CProtocal_send_mcu_packet_override: ams_mapping %d = %02x\n", i, old_map->dest[i]);
@@ -723,6 +741,13 @@ int CProtocal_send_mcu_packet_override(CProtocal *_this, void *payload, size_t p
                 slot_id_out = 0xFF;
             }
             uint16_t dest_id = (ams_id_out << 8) | slot_id_out;
+            
+            if (_this->gparser.use_ams == false) {
+                // New MC does not support M620 E0, and if you want to not
+                // use the AMS, you have to reply with an AMS mapping of
+                // 0xFF00 (use external spool tray).
+                dest_id = 0xff00;
+            }
             
             PRINTF_BLUE("forward: CProtocal_send_mcu_packet_override: AMS slot %d -> %04x\n", i, dest_id);
             new_map.dest[i] = dest_id;

@@ -137,15 +137,25 @@ struct __attribute__((packed)) bus_command_packet {
     uint8_t *payload;
 };
 
+struct CGparser {
+    char _dummy[0x5F8];
+    bool use_ams;
+    char _dummy2[0x1CF];
+    CProtocal *protocal;
+};
+static_assert(offsetof(struct CGparser, use_ams) == 0x5f8);
+static_assert(offsetof(struct CGparser, protocal) == 0x7c8);
+
 struct CProtocal {
-    char _dummy[0x25b0];
+    char _dummy[0x58];
+    union {
+        char _dummy2[0x2558];
+        struct CGparser gparser;
+    };
     packet_message_t packet_info[5][255];
     bus_command_packet *packet;
 };
-
-struct CGparser {
-    char _dummy[0x7c8];
-    CProtocal *protocal;
-};
+static_assert(offsetof(struct CProtocal, gparser) == 0x58);
+static_assert(offsetof(struct CProtocal, packet_info) == 0x25b0);
 
 void (*CGparser_publish_json)(CGparser *, json &, int) = (void(*)(CGparser *, json&, int))0x6aaf0;
