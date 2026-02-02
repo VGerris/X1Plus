@@ -648,6 +648,8 @@ int CProtocal_handle_mc_ams_flush_param(CProtocal *_this) {
 
 /*** AP-to-MC overrides ***/
 
+bool ams_is_enabled = true;
+
 int CProtocal_send_mcu_packet_override(CProtocal *_this, void *payload, size_t payload_length, uint32_t req, uint32_t dest, uint32_t src, uint32_t msg_id, uint32_t msg_class, uint32_t param_8) {
     if (!mc_speaks_new_protocol) {
         return CProtocal_send_mcu_packet_orig(_this, payload, payload_length, req, dest, src, msg_id, msg_class, param_8);
@@ -743,7 +745,7 @@ int CProtocal_send_mcu_packet_override(CProtocal *_this, void *payload, size_t p
         new_map.len = 0x20;
         new_map.vers = old_map->vers;
         PRINTF_BLUE("forward: CProtocal_send_mcu_packet_override: ams_mapping vers %02x\n", new_map.vers);
-        if (_this->gparser.use_ams == false) {
+        if (!ams_is_enabled) {
             PRINTF_BLUE("forward: CProtocal_send_mcu_packet_override: ams_mapping: use_ams = false!\n");
         }
         for (int i = 0; i < 16; i++) {
@@ -765,7 +767,7 @@ int CProtocal_send_mcu_packet_override(CProtocal *_this, void *payload, size_t p
             }
             uint16_t dest_id = (ams_id_out << 8) | slot_id_out;
             
-            if (_this->gparser.use_ams == false) {
+            if (!ams_is_enabled) {
                 // New MC does not support M620 E0, and if you want to not
                 // use the AMS, you have to reply with an AMS mapping of
                 // 0xFF00 (use external spool tray).
