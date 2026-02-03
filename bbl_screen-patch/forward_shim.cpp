@@ -761,7 +761,10 @@ int CProtocal_send_mcu_packet_override(CProtocal *_this, void *payload, size_t p
             int slot_id_out = old_map->dest[i] & 3;
             
             /* recompute the destination AMS ID */
-            if (ams_id_out < 4) {
+            if (old_map->dest[i] == 0xFE) {
+                ams_id_out = 0xFF;
+                slot_id_out = 0x00;
+            } else if (ams_id_out < 4) {
                 ams_id_out = ams_info[ams_id_out].phys_id;
                 if (ams_id_out & 0x80) {
                     slot_id_out = 0;
